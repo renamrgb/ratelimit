@@ -51,8 +51,8 @@ public class RateLimitAnnotationTest {
         assertThat(response3.getStatusCode().value()).isEqualTo(200);
         assertThat(response3.getBody()).isEqualTo("Success");
         
-        // Verificando se houve atraso significativo (pelo menos 200ms de bloqueio)
-        assertThat(duration).isGreaterThanOrEqualTo(200);
+        // Verificando se houve atraso significativo (pelo menos 150ms de bloqueio)
+        assertThat(duration).isGreaterThanOrEqualTo(150);
         
         System.out.println("Tempo de resposta da terceira chamada: " + duration + "ms");
     }

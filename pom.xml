@@ -133,7 +133,7 @@
 				<artifactId>gatling-maven-plugin</artifactId>
 				<version>${gatling-maven-plugin.version}</version>
 				<configuration>
-					<simulationsFolder>src/test/java</simulationsFolder>
+					<simulationsFolder>src/test/gatling/simulations</simulationsFolder>
 					<includes>
 						<include>com.example.ratelimit.loadtest.*</include>
 					</includes>

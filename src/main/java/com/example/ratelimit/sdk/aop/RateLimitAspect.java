@@ -3,13 +3,8 @@ package com.example.ratelimit.sdk.aop;
 import com.example.ratelimit.sdk.annotation.BackoffRetry;
 import com.example.ratelimit.sdk.annotation.RateLimit;
 import com.example.ratelimit.sdk.annotation.Retry;
-import io.github.bucket4j.Bandwidth;
+import com.example.ratelimit.sdk.service.RateLimitService;
 import io.github.bucket4j.Bucket;
-import io.github.bucket4j.BucketConfiguration;
-import io.github.bucket4j.ConsumptionProbe;
-import io.github.bucket4j.distributed.ExpirationAfterWriteStrategy;
-import io.github.bucket4j.redis.lettuce.cas.LettuceBasedProxyManager;
-import io.lettuce.core.api.StatefulRedisConnection;
 import io.micrometer.core.instrument.MeterRegistry;
 import io.micrometer.core.instrument.Tag;
 import io.micrometer.core.instrument.Timer;
@@ -41,27 +36,18 @@ import java.util.function.Supplier;
 public class RateLimitAspect {
 
     private static final Logger logger = LoggerFactory.getLogger(RateLimitAspect.class);
-    private static final String RATE_LIMITER_PREFIX = "rate_limiter:";
-    
-    private final LettuceBasedProxyManager<String> proxyManager;
-    private final Map<String, Bucket> localBucketCache = new ConcurrentHashMap<>();
+
+    private final RateLimitService rateLimitService;
     
     @Value("${rate-limit.enable-metrics:false}")
     private boolean enableMetrics;
     
-    @Value("${rate-limit.cache-expiry-seconds:300}")
-    private long cacheExpirySeconds;
-    
     @Autowired(required = false)
     private MeterRegistry meterRegistry;
 
-    public RateLimitAspect(StatefulRedisConnection<String, byte[]> redisConnection) {
-        this.proxyManager = LettuceBasedProxyManager
-                .builderFor(redisConnection)
-                .withExpirationStrategy(
-                    ExpirationAfterWriteStrategy.basedOnTimeForRefillingBucketUpToMax(
-                        Duration.ofSeconds(cacheExpirySeconds)))
-                .build();
+    @Autowired
+    public RateLimitAspect(RateLimitService rateLimitService) {
+        this.rateLimitService = rateLimitService;
     }
 
     @Around("@annotation(rateLimit)")
@@ -70,7 +56,7 @@ public class RateLimitAspect {
         final Method method = signature.getMethod();
         final String methodName = method.getDeclaringClass().getSimpleName() + "." + method.getName();
         
-        String key = generateKey(rateLimit.key(), methodName);
+        String key = rateLimitService.generateKey(rateLimit.key(), methodName);
         Retry retry = rateLimit.retry();
 
         Timer.Sample sample = null;
@@ -100,16 +86,12 @@ public class RateLimitAspect {
         }
     }
 
-    private String generateKey(String userKey, String methodName) {
-        return RATE_LIMITER_PREFIX + userKey + ":" + methodName;
-    }
-
     private Object execute(final ProceedingJoinPoint joinPoint, final String key, final RateLimit rateLimit) throws Throwable {
-        Bucket bucket = resolveBucket(key, rateLimit);
-        consumeToken(bucket, key);
+        Bucket bucket = rateLimitService.getBucket(key, rateLimit);
+        rateLimitService.consumeToken(bucket, key);
         return joinPoint.proceed();
     }
-    
+
     private Object executeAsync(final ProceedingJoinPoint joinPoint, final String key, 
                                final RateLimit rateLimit, final Retry retry) throws Throwable {
         if (retry.maxAttempts() > 1) {
@@ -149,16 +131,12 @@ public class RateLimitAspect {
     
     private Object executeAsyncInternal(final ProceedingJoinPoint joinPoint, 
                                       final String key, final RateLimit rateLimit) throws Throwable {
-        BucketConfiguration bucketConfig = createBucketConfiguration(rateLimit);
+        Bucket bucket = rateLimitService.getBucket(key, rateLimit);
+        
         try {
-            Bucket bucket = proxyManager.builder().build(key, () -> bucketConfig);
-            
             CompletableFuture<Boolean> consumptionFuture = CompletableFuture.supplyAsync(() -> {
                 try {
-                    // Em vez de tentar consumir, usamos o modo de bloqueio para garantir
-                    // que a operação assíncrona aguarde até que um token esteja disponível
-                    bucket.asBlocking().consume(1);
-                    return true;
+                    return rateLimitService.consumeTokenAsync(bucket, key);
                 } catch (InterruptedException e) {
                     Thread.currentThread().interrupt();
                     return false;
@@ -170,7 +148,7 @@ public class RateLimitAspect {
                 throw new RuntimeException("Interrompido enquanto aguardava token disponível para: " + key);
             }
             
-            return joinPoint.proceed();
+        return joinPoint.proceed();
         } catch (ExecutionException e) {
             throw new RuntimeException("Falha ao consumir token de forma assíncrona", e.getCause());
         }
@@ -263,70 +241,6 @@ public class RateLimitAspect {
         }
     }
 
-    private Bucket resolveBucket(final String key, final RateLimit rateLimit) {
-        // Tenta obter do cache local primeiro para reduzir overhead de rede
-        return localBucketCache.computeIfAbsent(key, k -> {
-            BucketConfiguration bucketConfig = createBucketConfiguration(rateLimit);
-            return proxyManager.builder().build(k, () -> bucketConfig);
-        });
-    }
-    
-    private BucketConfiguration createBucketConfiguration(RateLimit rateLimit) {
-        return BucketConfiguration.builder()
-                .addLimit(createBandwidth(rateLimit))
-                .build();
-    }
-    
-    private Bandwidth createBandwidth(RateLimit rateLimit) {
-        long nanosInTimeUnit = rateLimit.timeUnit().getTimeInNanos();
-        
-        Bandwidth bandwidth;
-        if (rateLimit.greedyRefill()) {
-            bandwidth = Bandwidth.builder()
-                .capacity(rateLimit.limit() + rateLimit.overdraft())
-                .refillGreedy(rateLimit.limit(), Duration.ofNanos(nanosInTimeUnit))
-                .build();
-        } else {
-            bandwidth = Bandwidth.builder()
-                .capacity(rateLimit.limit() + rateLimit.overdraft())
-                .refillIntervally(rateLimit.limit(), Duration.ofNanos(nanosInTimeUnit))
-                .build();
-        }
-        
-        return bandwidth;
-    }
-    
-    private void consumeToken(Bucket bucket, String key) {
-        ConsumptionProbe probe = bucket.tryConsumeAndReturnRemaining(1);
-        
-        if (enableMetrics && meterRegistry != null) {
-            meterRegistry.gauge("rate_limit.remaining_tokens", 
-                    Arrays.asList(Tag.of("key", key)), 
-                    probe.getRemainingTokens());
-        }
-        
-        if (!probe.isConsumed()) {
-            long waitForRefillMillis = probe.getNanosToWaitForRefill() / 1_000_000;
-            logger.warn("[RateLimit] Key: {}, Sem tokens disponíveis. Aguardando aproximadamente {} ms", key, waitForRefillMillis);
-            
-            try {
-                // Usar o modo de bloqueio para aguardar até que um token esteja disponível
-                bucket.asBlocking().consume(1);
-                logger.info("[RateLimit] Key: {}, Token adquirido após aguardar", key);
-                
-                if (enableMetrics && meterRegistry != null) {
-                    meterRegistry.timer("rate_limit.wait_time", 
-                            Arrays.asList(Tag.of("key", key)))
-                            .record(Duration.ofMillis(waitForRefillMillis));
-                }
-            } catch (InterruptedException e) {
-                logger.error("[RateLimit] Thread interrompida enquanto aguardava token", e);
-                Thread.currentThread().interrupt();
-                throw new RuntimeException("Interrompido enquanto aguardava token disponível", e);
-            }
-        }
-    }
-
     private RetryTemplate createRetryTemplate(final Retry retry) {
         final RetryTemplate retryTemplate = new RetryTemplate();
 
@@ -354,7 +268,7 @@ public class RateLimitAspect {
         }
         return retryableExceptions;
     }
-    
+
     private boolean shouldRetry(Throwable ex, Retry retry) {
         Map<Class<? extends Throwable>, Boolean> retryableExceptions = createRetryableExceptions(retry);
         
