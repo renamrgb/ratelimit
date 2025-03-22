@@ -78,6 +78,17 @@ public @interface RateLimit {
     Retry retry() default @Retry(maxAttempts = 0);
 
     /**
+     * Define se as operações de rate limit devem ser executadas de forma assíncrona.
+     * <p>
+     * Quando habilitado, as operações de consumo de tokens do bucket não bloqueiam
+     * a thread de execução, permitindo maior throughput em aplicações com alta carga.
+     * </p>
+     *
+     * @return true para usar operações assíncronas, false para síncronas (padrão: false).
+     */
+    boolean async() default false;
+
+    /**
      * Enum para definir as unidades de tempo utilizadas no rate limit.
      */
     enum TimeUnit {

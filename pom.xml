@@ -65,13 +65,13 @@
 		</dependency>
 		<dependency>
 			<groupId>com.bucket4j</groupId>
-			<artifactId>bucket4j_jdk17-jedis</artifactId>
+			<artifactId>bucket4j_jdk17-lettuce</artifactId>
 			<version>8.14.0</version>
 		</dependency>
 		<dependency>
-			<groupId>redis.clients</groupId>
-			<artifactId>jedis</artifactId>
-			<version>4.2.3</version>
+			<groupId>io.lettuce</groupId>
+			<artifactId>lettuce-core</artifactId>
+			<version>6.3.1.RELEASE</version>
 		</dependency>
 		
 		<!-- Micrometer dependency for metrics -->

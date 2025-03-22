@@ -8,9 +8,8 @@ import io.github.bucket4j.Bucket;
 import io.github.bucket4j.BucketConfiguration;
 import io.github.bucket4j.ConsumptionProbe;
 import io.github.bucket4j.distributed.ExpirationAfterWriteStrategy;
-import io.github.bucket4j.distributed.proxy.ProxyManager;
-import io.github.bucket4j.distributed.serialization.Mapper;
-import io.github.bucket4j.redis.jedis.Bucket4jJedis;
+import io.github.bucket4j.redis.lettuce.cas.LettuceBasedProxyManager;
+import io.lettuce.core.api.StatefulRedisConnection;
 import io.micrometer.core.instrument.MeterRegistry;
 import io.micrometer.core.instrument.Tag;
 import io.micrometer.core.instrument.Timer;
@@ -27,13 +26,14 @@ import org.springframework.retry.backoff.ExponentialBackOffPolicy;
 import org.springframework.retry.policy.SimpleRetryPolicy;
 import org.springframework.retry.support.RetryTemplate;
 import org.springframework.stereotype.Component;
-import redis.clients.jedis.JedisPool;
 
 import java.lang.reflect.Method;
 import java.time.Duration;
 import java.util.Arrays;
 import java.util.Map;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ExecutionException;
 import java.util.function.Supplier;
 
 @Aspect
@@ -43,7 +43,7 @@ public class RateLimitAspect {
     private static final Logger logger = LoggerFactory.getLogger(RateLimitAspect.class);
     private static final String RATE_LIMITER_PREFIX = "rate_limiter:";
     
-    private final ProxyManager<String> proxyManager;
+    private final LettuceBasedProxyManager<String> proxyManager;
     private final Map<String, Bucket> localBucketCache = new ConcurrentHashMap<>();
     
     @Value("${rate-limit.enable-metrics:false}")
@@ -55,10 +55,12 @@ public class RateLimitAspect {
     @Autowired(required = false)
     private MeterRegistry meterRegistry;
 
-    public RateLimitAspect(JedisPool jedisPool) {
-        this.proxyManager = Bucket4jJedis.casBasedBuilder(jedisPool)
-                .expirationAfterWrite(ExpirationAfterWriteStrategy.basedOnTimeForRefillingBucketUpToMax(Duration.ofSeconds(cacheExpirySeconds)))
-                .keyMapper(Mapper.STRING)
+    public RateLimitAspect(StatefulRedisConnection<String, byte[]> redisConnection) {
+        this.proxyManager = LettuceBasedProxyManager
+                .builderFor(redisConnection)
+                .withExpirationStrategy(
+                    ExpirationAfterWriteStrategy.basedOnTimeForRefillingBucketUpToMax(
+                        Duration.ofSeconds(cacheExpirySeconds)))
                 .build();
     }
 
@@ -69,7 +71,6 @@ public class RateLimitAspect {
         final String methodName = method.getDeclaringClass().getSimpleName() + "." + method.getName();
         
         String key = generateKey(rateLimit.key(), methodName);
-        Bucket bucket = resolveBucket(key, rateLimit);
         Retry retry = rateLimit.retry();
 
         Timer.Sample sample = null;
@@ -78,17 +79,22 @@ public class RateLimitAspect {
         }
 
         try {
-            if (retry.maxAttempts() > 1) {
-                return executeWithRetry(joinPoint, retry, bucket, key);
+            if (rateLimit.async()) {
+                return executeAsync(joinPoint, key, rateLimit, retry);
             } else {
-                return execute(joinPoint, bucket, key);
+                if (retry.maxAttempts() > 1) {
+                    return executeWithRetry(joinPoint, retry, key, rateLimit);
+                } else {
+                    return execute(joinPoint, key, rateLimit);
+                }
             }
         } finally {
             if (sample != null) {
                 sample.stop(meterRegistry.timer("rate_limit.execution", 
                         Arrays.asList(
                             Tag.of("method", methodName),
-                            Tag.of("key", rateLimit.key())
+                            Tag.of("key", rateLimit.key()),
+                            Tag.of("async", String.valueOf(rateLimit.async()))
                         )));
             }
         }
@@ -98,16 +104,84 @@ public class RateLimitAspect {
         return RATE_LIMITER_PREFIX + userKey + ":" + methodName;
     }
 
-    private Object execute(final ProceedingJoinPoint joinPoint, final Bucket bucket, final String key) throws Throwable {
+    private Object execute(final ProceedingJoinPoint joinPoint, final String key, final RateLimit rateLimit) throws Throwable {
+        Bucket bucket = resolveBucket(key, rateLimit);
         consumeToken(bucket, key);
         return joinPoint.proceed();
     }
+    
+    private Object executeAsync(final ProceedingJoinPoint joinPoint, final String key, 
+                               final RateLimit rateLimit, final Retry retry) throws Throwable {
+        if (retry.maxAttempts() > 1) {
+            final RetryTemplate retryTemplate = createRetryTemplate(retry);
+            return retryTemplate.execute(context -> {
+                try {
+                    return executeAsyncInternal(joinPoint, key, rateLimit);
+                } catch (Throwable ex) {
+                    if (shouldRetry(ex, retry)) {
+                        logger.warn("[Retry] Retrying after exception: {}, Attempt: {}", ex.getClass().getSimpleName(),
+                                context.getRetryCount() + 1);
 
-    private Object executeWithRetry(final ProceedingJoinPoint joinPoint, final Retry retry, final Bucket bucket, final String key) throws Throwable {
+                        if (enableMetrics && meterRegistry != null) {
+                            meterRegistry.counter("rate_limit.retry.count", 
+                                    Arrays.asList(
+                                        Tag.of("key", key),
+                                        Tag.of("exception", ex.getClass().getSimpleName())
+                                    )).increment();
+                        }
+
+                        throw ex;
+                    }
+                    throw ex;
+                }
+            }, context -> {
+                Throwable ex = context.getLastThrowable();
+                if (!retry.fallbackMethod().isEmpty()) {
+                    logger.info("[Fallback] Max retries reached. Invoking fallback: {}", retry.fallbackMethod());
+                    return invokeFallback(joinPoint, retry.fallbackMethod(), ex);
+                }
+                throw new RuntimeException("Rate limit exceeded with retries exhausted", ex);
+            });
+        } else {
+            return executeAsyncInternal(joinPoint, key, rateLimit);
+        }
+    }
+    
+    private Object executeAsyncInternal(final ProceedingJoinPoint joinPoint, 
+                                      final String key, final RateLimit rateLimit) throws Throwable {
+        BucketConfiguration bucketConfig = createBucketConfiguration(rateLimit);
+        try {
+            Bucket bucket = proxyManager.builder().build(key, () -> bucketConfig);
+            
+            CompletableFuture<Boolean> consumptionFuture = CompletableFuture.supplyAsync(() -> {
+                try {
+                    // Em vez de tentar consumir, usamos o modo de bloqueio para garantir
+                    // que a operação assíncrona aguarde até que um token esteja disponível
+                    bucket.asBlocking().consume(1);
+                    return true;
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    return false;
+                }
+            });
+            
+            Boolean consumed = consumptionFuture.get();
+            if (!consumed) {
+                throw new RuntimeException("Interrompido enquanto aguardava token disponível para: " + key);
+            }
+            
+            return joinPoint.proceed();
+        } catch (ExecutionException e) {
+            throw new RuntimeException("Falha ao consumir token de forma assíncrona", e.getCause());
+        }
+    }
+
+    private Object executeWithRetry(final ProceedingJoinPoint joinPoint, final Retry retry, 
+                                   final String key, final RateLimit rateLimit) throws Throwable {
         final RetryTemplate retryTemplate = createRetryTemplate(retry);
         return retryTemplate.execute(context -> {
             try {
-                return execute(joinPoint, bucket, key);
+                return execute(joinPoint, key, rateLimit);
             } catch (Throwable ex) {
                 if (shouldRetry(ex, retry)) {
                     logger.warn("[Retry] Retrying after exception: {}, Attempt: {}", ex.getClass().getSimpleName(),
@@ -192,16 +266,15 @@ public class RateLimitAspect {
     private Bucket resolveBucket(final String key, final RateLimit rateLimit) {
         // Tenta obter do cache local primeiro para reduzir overhead de rede
         return localBucketCache.computeIfAbsent(key, k -> {
-            Supplier<BucketConfiguration> configSupplier = () -> {
-                BucketConfiguration bucketConfig = BucketConfiguration.builder()
-                    .addLimit(createBandwidth(rateLimit))
-                    .build();
-                
-                return bucketConfig;
-            };
-            
-            return proxyManager.getProxy(k, configSupplier);
+            BucketConfiguration bucketConfig = createBucketConfiguration(rateLimit);
+            return proxyManager.builder().build(k, () -> bucketConfig);
         });
+    }
+    
+    private BucketConfiguration createBucketConfiguration(RateLimit rateLimit) {
+        return BucketConfiguration.builder()
+                .addLimit(createBandwidth(rateLimit))
+                .build();
     }
     
     private Bandwidth createBandwidth(RateLimit rateLimit) {
@@ -221,6 +294,37 @@ public class RateLimitAspect {
         }
         
         return bandwidth;
+    }
+    
+    private void consumeToken(Bucket bucket, String key) {
+        ConsumptionProbe probe = bucket.tryConsumeAndReturnRemaining(1);
+        
+        if (enableMetrics && meterRegistry != null) {
+            meterRegistry.gauge("rate_limit.remaining_tokens", 
+                    Arrays.asList(Tag.of("key", key)), 
+                    probe.getRemainingTokens());
+        }
+        
+        if (!probe.isConsumed()) {
+            long waitForRefillMillis = probe.getNanosToWaitForRefill() / 1_000_000;
+            logger.warn("[RateLimit] Key: {}, Sem tokens disponíveis. Aguardando aproximadamente {} ms", key, waitForRefillMillis);
+            
+            try {
+                // Usar o modo de bloqueio para aguardar até que um token esteja disponível
+                bucket.asBlocking().consume(1);
+                logger.info("[RateLimit] Key: {}, Token adquirido após aguardar", key);
+                
+                if (enableMetrics && meterRegistry != null) {
+                    meterRegistry.timer("rate_limit.wait_time", 
+                            Arrays.asList(Tag.of("key", key)))
+                            .record(Duration.ofMillis(waitForRefillMillis));
+                }
+            } catch (InterruptedException e) {
+                logger.error("[RateLimit] Thread interrompida enquanto aguardava token", e);
+                Thread.currentThread().interrupt();
+                throw new RuntimeException("Interrompido enquanto aguardava token disponível", e);
+            }
+        }
     }
 
     private RetryTemplate createRetryTemplate(final Retry retry) {
@@ -250,48 +354,16 @@ public class RateLimitAspect {
         }
         return retryableExceptions;
     }
-
-    private void consumeToken(final Bucket bucket, final String key) throws InterruptedException {
-        ConsumptionProbe probe = bucket.tryConsumeAndReturnRemaining(1);
+    
+    private boolean shouldRetry(Throwable ex, Retry retry) {
+        Map<Class<? extends Throwable>, Boolean> retryableExceptions = createRetryableExceptions(retry);
         
-        if (enableMetrics && meterRegistry != null) {
-            meterRegistry.gauge("rate_limit.remaining_tokens", 
-                    Arrays.asList(Tag.of("key", key)), 
-                    probe.getRemainingTokens());
+        for (Map.Entry<Class<? extends Throwable>, Boolean> entry : retryableExceptions.entrySet()) {
+            if (entry.getKey().isAssignableFrom(ex.getClass())) {
+                return entry.getValue();
+            }
         }
         
-        if (!probe.isConsumed()) {
-            long waitForRefillMillis = probe.getNanosToWaitForRefill() / 1_000_000;
-            logger.warn("[RateLimit] Key: {}, No tokens available. Acquiring token in approximately {} ms", key, waitForRefillMillis);
-
-            try {
-                bucket.asBlocking().consume(1);
-                logger.info("[RateLimit] Key: {}, Token acquired after wait", key);
-                
-                if (enableMetrics && meterRegistry != null) {
-                    meterRegistry.timer("rate_limit.wait_time", 
-                            Arrays.asList(Tag.of("key", key)))
-                            .record(Duration.ofMillis(waitForRefillMillis));
-                }
-            } catch (InterruptedException e) {
-                logger.error("[RateLimit] Thread interrupted while waiting for token", e);
-                Thread.currentThread().interrupt();
-                throw e;
-            }
-        }
-    }
-
-    private boolean shouldRetry(final Throwable ex, final Retry retry) {
-        for (Class<? extends Throwable> excluded : retry.exclude()) {
-            if (excluded.isAssignableFrom(ex.getClass())) {
-                return false;
-            }
-        }
-        for (Class<? extends Throwable> included : retry.include()) {
-            if (included.isAssignableFrom(ex.getClass())) {
-                return true;
-            }
-        }
         return false;
     }
 }

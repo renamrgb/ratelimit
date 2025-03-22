@@ -46,6 +46,41 @@ public class TestController {
     public ResponseEntity<String> normalTest() {
         return ResponseEntity.ok("Test Normal");
     }
+    
+    @RateLimit(
+            key = "test-async",
+            limit = 3,
+            timeUnit = RateLimit.TimeUnit.SECONDS,
+            async = true
+    )
+    @GetMapping("/async")
+    public ResponseEntity<String> asyncTest() {
+        return ResponseEntity.ok("Teste com Rate Limit Assíncrono");
+    }
+    
+    @RateLimit(
+            key = "test-async-retry",
+            limit = 5,
+            timeUnit = RateLimit.TimeUnit.MINUTES,
+            async = true,
+            retry = @Retry(
+                    maxAttempts = 3,
+                    include = {RuntimeException.class},
+                    fallbackMethod = "fallback",
+                    backoff = @BackoffRetry(
+                            delay = 500,
+                            multiplier = 2
+                    )
+            )
+    )
+    @GetMapping("/async-retry")
+    public ResponseEntity<String> asyncRetryTest() {
+        double random = Math.random();
+        if (random < 0.7) {
+            throw new RuntimeException("Erro simulado para testar retry assíncrono");
+        }
+        return ResponseEntity.ok("Teste com Rate Limit Assíncrono e Retry");
+    }
 
     public ResponseEntity<String> fallback(Throwable throwable) {
         return ResponseEntity.ok(String.format("Fallback method " + throwable.getMessage()));

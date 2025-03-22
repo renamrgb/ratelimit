@@ -1,10 +1,14 @@
 package com.example.ratelimit.sdk.configuration;
 
+import io.lettuce.core.RedisClient;
+import io.lettuce.core.RedisURI;
+import io.lettuce.core.api.StatefulRedisConnection;
+import io.lettuce.core.api.async.RedisAsyncCommands;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
-import redis.clients.jedis.JedisPool;
-import redis.clients.jedis.JedisPoolConfig;
+
+import java.time.Duration;
 
 @Configuration
 public class RedisConfig {
@@ -18,25 +22,35 @@ public class RedisConfig {
     @Value("${redis.timeout:2000}")
     private int redisTimeout;
 
-    @Value("${redis.pool.max-total:50}")
-    private int poolMaxTotal;
-
-    @Value("${redis.pool.max-idle:20}")
-    private int poolMaxIdle;
-
-    @Value("${redis.pool.min-idle:5}")
-    private int poolMinIdle;
+    @Value("${redis.database:0}")
+    private int redisDatabase;
+    
+    @Value("${redis.password:}")
+    private String redisPassword;
 
     @Bean
-    public JedisPool jedisPool() {
-        JedisPoolConfig poolConfig = new JedisPoolConfig();
-        poolConfig.setMaxTotal(poolMaxTotal);
-        poolConfig.setMaxIdle(poolMaxIdle);
-        poolConfig.setMinIdle(poolMinIdle);
-        poolConfig.setTestOnBorrow(true);
-        poolConfig.setTestWhileIdle(true);
-        poolConfig.setJmxEnabled(false);
+    public RedisClient redisClient() {
+        RedisURI redisURI = RedisURI.builder()
+                .withHost(redisHost)
+                .withPort(redisPort)
+                .withDatabase(redisDatabase)
+                .withTimeout(Duration.ofMillis(redisTimeout))
+                .build();
         
-        return new JedisPool(poolConfig, redisHost, redisPort, redisTimeout);
+        if (redisPassword != null && !redisPassword.isEmpty()) {
+            redisURI.setPassword(redisPassword);
+        }
+        
+        return RedisClient.create(redisURI);
+    }
+
+    @Bean
+    public StatefulRedisConnection<String, byte[]> redisConnection(RedisClient redisClient) {
+        return redisClient.connect(new RateLimitRedisCodec());
+    }
+
+    @Bean
+    public RedisAsyncCommands<String, byte[]> redisAsyncCommands(StatefulRedisConnection<String, byte[]> connection) {
+        return connection.async();
     }
 }
