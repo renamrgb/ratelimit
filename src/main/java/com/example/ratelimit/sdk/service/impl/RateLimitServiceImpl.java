@@ -5,8 +5,10 @@ import com.example.ratelimit.sdk.service.RateLimitService;
 import com.example.ratelimit.sdk.service.factory.BucketFactory;
 import io.github.bucket4j.Bucket;
 import io.github.bucket4j.ConsumptionProbe;
+import io.micrometer.core.instrument.Counter;
 import io.micrometer.core.instrument.MeterRegistry;
 import io.micrometer.core.instrument.Tag;
+import io.micrometer.core.instrument.Timer;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -15,6 +17,7 @@ import org.springframework.stereotype.Service;
 
 import java.time.Duration;
 import java.util.Arrays;
+import java.util.concurrent.CompletableFuture;
 
 @Service
 public class RateLimitServiceImpl implements RateLimitService {
@@ -23,6 +26,9 @@ public class RateLimitServiceImpl implements RateLimitService {
     private static final String RATE_LIMITER_PREFIX = "rate_limiter:";
     
     private final BucketFactory bucketFactory;
+    private final Counter rateLimitExceededCounter;
+    private final Counter rateLimitSuccessCounter;
+    private final Timer rateLimitResponseTime;
     
     @Value("${rate-limit.enable-metrics:false}")
     private boolean enableMetrics;
@@ -31,63 +37,72 @@ public class RateLimitServiceImpl implements RateLimitService {
     private MeterRegistry meterRegistry;
 
     @Autowired
-    public RateLimitServiceImpl(BucketFactory bucketFactory) {
+    public RateLimitServiceImpl(BucketFactory bucketFactory, 
+                               Counter rateLimitExceededCounter,
+                               Counter rateLimitSuccessCounter,
+                               Timer rateLimitResponseTime) {
         this.bucketFactory = bucketFactory;
+        this.rateLimitExceededCounter = rateLimitExceededCounter;
+        this.rateLimitSuccessCounter = rateLimitSuccessCounter;
+        this.rateLimitResponseTime = rateLimitResponseTime;
     }
 
     @Override
-    public String generateKey(String userKey, String methodName) {
-        return RATE_LIMITER_PREFIX + userKey + ":" + methodName;
+    public String generateKey(String className, String methodName, String ip, String userId) {
+        StringBuilder keyBuilder = new StringBuilder(className).append(".").append(methodName);
+        
+        if (ip != null && !ip.isEmpty()) {
+            keyBuilder.append(".").append(ip);
+        }
+        
+        if (userId != null && !userId.isEmpty()) {
+            keyBuilder.append(".").append(userId);
+        }
+        
+        return keyBuilder.toString();
     }
 
     @Override
     public Bucket getBucket(String key, RateLimit rateLimit) {
         return bucketFactory.createBucket(key, rateLimit);
     }
-    
+
     @Override
-    public void consumeToken(Bucket bucket, String key) {
-        ConsumptionProbe probe = bucket.tryConsumeAndReturnRemaining(1);
-        
-        if (enableMetrics && meterRegistry != null) {
-            meterRegistry.gauge("rate_limit.remaining_tokens", 
-                    Arrays.asList(Tag.of("key", key)), 
-                    probe.getRemainingTokens());
-        }
-        
-        if (!probe.isConsumed()) {
-            long waitForRefillMillis = probe.getNanosToWaitForRefill() / 1_000_000;
-            logger.warn("[RateLimit] Key: {}, Sem tokens disponíveis. Aguardando aproximadamente {} ms", key, waitForRefillMillis);
-            
-            try {
-                // Usar o modo de bloqueio para aguardar até que um token esteja disponível
-                bucket.asBlocking().consume(1);
-                logger.info("[RateLimit] Key: {}, Token adquirido após aguardar", key);
-                
-                if (enableMetrics && meterRegistry != null) {
-                    meterRegistry.timer("rate_limit.wait_time", 
-                            Arrays.asList(Tag.of("key", key)))
-                            .record(Duration.ofMillis(waitForRefillMillis));
-                }
-            } catch (InterruptedException e) {
-                logger.error("[RateLimit] Thread interrompida enquanto aguardava token", e);
-                Thread.currentThread().interrupt();
-                throw new RuntimeException("Interrompido enquanto aguardava token disponível", e);
+    public boolean consumeToken(String key, RateLimit rateLimit, long tokens) {
+        Timer.Sample sample = Timer.start();
+        try {
+            Bucket bucket = getBucket(key, rateLimit);
+            boolean consumed = bucket.tryConsume(tokens);
+            if (consumed) {
+                rateLimitSuccessCounter.increment();
+            } else {
+                rateLimitExceededCounter.increment();
+                logger.warn("Rate limit exceeded for key: {}", key);
             }
+            return consumed;
+        } finally {
+            sample.stop(rateLimitResponseTime);
         }
     }
-    
+
     @Override
-    public boolean consumeTokenAsync(Bucket bucket, String key) throws InterruptedException {
-        try {
-            // Em vez de tentar consumir, usamos o modo de bloqueio para garantir
-            // que a operação assíncrona aguarde até que um token esteja disponível
-            bucket.asBlocking().consume(1);
-            return true;
-        } catch (InterruptedException e) {
-            logger.error("[RateLimit] Thread interrompida enquanto aguardava token assíncrono", e);
-            Thread.currentThread().interrupt();
-            throw e;
-        }
+    public CompletableFuture<Boolean> consumeTokenAsync(String key, RateLimit rateLimit, long tokens) {
+        Timer.Sample sample = Timer.start();
+        
+        Bucket bucket = getBucket(key, rateLimit);
+        // Usando tryConsume para operação síncrona mas envolto em CompletableFuture para manter API assíncrona
+        CompletableFuture<Boolean> future = CompletableFuture.supplyAsync(() -> bucket.tryConsume(tokens));
+        
+        future.thenAccept(consumed -> {
+            if (consumed) {
+                rateLimitSuccessCounter.increment();
+            } else {
+                rateLimitExceededCounter.increment();
+                logger.warn("Rate limit exceeded for key: {}", key);
+            }
+            sample.stop(rateLimitResponseTime);
+        });
+        
+        return future;
     }
 } 

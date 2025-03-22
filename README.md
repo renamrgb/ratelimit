@@ -1,109 +1,77 @@
-# SDK de Rate Limit com Redis
+# Rate Limit com Redis e Prometheus/Grafana
 
-Este projeto implementa um SDK para controle de rate limit em aplicações Spring Boot, utilizando Redis como armazenamento distribuído e oferecendo suporte a operações assíncronas.
+## Sobre o Projeto
+Sistema de rate limiting distribuído usando Spring Boot, Redis, Bucket4j, Prometheus e Grafana para visualização de métricas.
 
-## Características
+## Requisitos
+- Java 17
+- Maven
+- Docker e Docker Compose
 
-- **Rate Limit Distribuído**: Utiliza o Redis como armazenamento para garantir que o rate limit seja respeitado mesmo em ambiente com múltiplas instâncias.
-- **Suporte Assíncrono**: Permite operações assíncronas para melhor desempenho em aplicações com alta carga.
-- **Configuração Flexível**: Diversas opções de configuração via propriedades.
-- **Suporte a Overdraft**: Capacidade para lidar com picos de tráfego temporários.
-- **Opções de Refill**: Modos greedy ou interval para recarga de tokens.
-- **Cache de Buckets Local**: Melhor performance com cache em memória.
-- **Métricas com Micrometer**: Monitoramento detalhado do funcionamento do rate limit.
-- **Sistema de Retry**: Com backoff exponencial para tratamento de falhas.
+## Tecnologias Utilizadas
+- **Spring Boot**: Framework para criação de aplicações Java
+- **Bucket4j**: Biblioteca para implementação de rate limiting
+- **Redis**: Banco de dados em memória para armazenamento distribuído dos buckets
+- **Prometheus**: Coleta e armazenamento de métricas
+- **Grafana**: Visualização de métricas e criação de dashboards
 
-## Tecnologias
+## Como Executar
 
-- Spring Boot 3.3.5
-- Redis com Lettuce
-- Bucket4j 8.14.0
-- Micrometer 1.11.5
+### 1. Clonar o repositório
 
-## Uso da Anotação
-
-```java
-// Rate Limit Simples
-@RateLimit(
-    key = "test-normal",
-    limit = 10,
-    timeUnit = RateLimit.TimeUnit.SECONDS
-)
-public ResponseEntity<String> normalTest() {
-    return ResponseEntity.ok("Test Normal");
-}
-
-// Rate Limit Assíncrono
-@RateLimit(
-    key = "test-async",
-    limit = 10,
-    timeUnit = RateLimit.TimeUnit.SECONDS,
-    async = true
-)
-public ResponseEntity<String> asyncTest() {
-    return ResponseEntity.ok("Teste Assíncrono");
-}
-
-// Rate Limit com Retry e Fallback
-@RateLimit(
-    key = "test-retry",
-    limit = 5,
-    timeUnit = RateLimit.TimeUnit.MINUTES,
-    overdraft = 2,
-    greedyRefill = true,
-    retry = @Retry(
-        maxAttempts = 3,
-        include = {RuntimeException.class},
-        fallbackMethod = "fallback",
-        backoff = @BackoffRetry(
-            delay = 500,
-            multiplier = 2
-        )
-    )
-)
-public ResponseEntity<String> retryTest() {
-    // ... implementação
-}
-
-// Método de fallback
-public ResponseEntity<String> fallback(Throwable throwable) {
-    return ResponseEntity.ok("Fallback: " + throwable.getMessage());
-}
+### 2. Compilar o projeto
+```bash
+mvn clean package
 ```
 
-## Configuração
-
-No arquivo `application.properties`:
-
-```properties
-# Redis
-redis.host=localhost
-redis.port=6379
-redis.timeout=2000
-redis.database=0
-redis.password=
-
-# Rate Limit
-rate-limit.enable-metrics=true
-rate-limit.cache-expiry-seconds=300
+### 3. Executar com Docker Compose
+```bash
+docker-compose up
 ```
+Este comando iniciará os seguintes serviços:
+- Aplicação Spring Boot (porta 8080)
+- Redis (porta 6379)
+- Prometheus (porta 9090)
+- Grafana (porta 3000)
 
-## Implementação Assíncrona
+## Monitoramento com Grafana
 
-A implementação utiliza o cliente Lettuce para Redis, que oferece suporte nativo a operações assíncronas. Quando a propriedade `async = true` é definida na anotação `@RateLimit`, as operações de consumo de tokens são realizadas de forma assíncrona, utilizando CompletableFuture.
+### Acessar o Grafana
+1. Abra o navegador e acesse: `http://localhost:3000`
+2. Faça login com as credenciais padrão:
+   - Usuário: `admin`
+   - Senha: `admin`
 
-Isso é especialmente útil em aplicações com alta carga, pois permite:
+### Configurar a fonte de dados Prometheus
+1. Navegue até Configuração > Fontes de Dados
+2. Clique em "Adicionar fonte de dados"
+3. Selecione "Prometheus"
+4. Configure a URL: `http://prometheus:9090`
+5. Clique em "Salvar & Testar"
 
-1. Não bloquear a thread principal durante operações de I/O com o Redis
-2. Maior throughput para aplicações com muitas requisições concorrentes
-3. Melhor aproveitamento de recursos do sistema
+### Importar o Dashboard para Rate Limiting
+1. Navegue até Dashboards > Importar
+2. Clique em "Importar" e em "Enviar JSON"
+3. Cole o conteúdo do arquivo `grafana-dashboard.json` ou use o ID 13877 (JVM Micrometer) para início
+4. Selecione a fonte de dados Prometheus configurada anteriormente
+5. Clique em "Importar"
 
-## Implementação com Lettuce
+## Métricas Disponíveis
+As seguintes métricas estão disponíveis para monitoramento:
+- `ratelimit.exceeded`: Contador de eventos de limite de taxa excedido
+- `ratelimit.success`: Contador de requisições bem-sucedidas com limite de taxa
+- `ratelimit.response.time`: Tempo de resposta para operações com limite de taxa
 
-O cliente Lettuce foi escolhido por suportar operações assíncronas de forma nativa e por ser o cliente Redis recomendado para aplicações Spring Boot modernas. Ele oferece:
+## Endpoints da API
+- `GET /test/limit`: Endpoint de teste com rate limiting
 
-- Melhor desempenho em comparação com Jedis
-- Suporte nativo a operações assíncronas
-- Gerenciamento automático de conexões
-- Compatibilidade com recursos modernos do Redis
-- API mais amigável e orientada a reatividade 
+## Endpoints do Actuator
+- `http://localhost:8080/actuator/health`: Status da aplicação
+- `http://localhost:8080/actuator/prometheus`: Métricas para o Prometheus
+- `http://localhost:8080/actuator/metrics`: Métricas gerais
+
+## Próximos Passos
+1. Implementar autenticação para o rate limiting baseado em usuário
+2. Adicionar mais métricas específicas para diferentes endpoints
+3. Configurar alarmes no Grafana para notificações de limite excedido
+4. Expandir para suportar diferentes estratégias de rate limiting 
