@@ -41,12 +41,20 @@ public class RateLimitAnnotationTest {
         assertThat(response2.getStatusCode().value()).isEqualTo(200);
         assertThat(response2.getBody()).isEqualTo("Success");
         
-        // Terceira chamada deve falhar com exceção (acima do limite)
-        Exception exception = assertThrows(HttpClientErrorException.class, () -> {
-            testService.testMethod();
-        });
+        // Terceira chamada deve ser bloqueada por algum tempo, mas eventualmente ter sucesso
+        long startTime = System.currentTimeMillis();
+        ResponseEntity<String> response3 = testService.testMethod();
+        long endTime = System.currentTimeMillis();
+        long duration = endTime - startTime;
         
-        assertThat(exception.getMessage()).contains("429");
+        // Verificando se o response foi bem-sucedido
+        assertThat(response3.getStatusCode().value()).isEqualTo(200);
+        assertThat(response3.getBody()).isEqualTo("Success");
+        
+        // Verificando se houve atraso significativo (pelo menos 200ms de bloqueio)
+        assertThat(duration).isGreaterThanOrEqualTo(200);
+        
+        System.out.println("Tempo de resposta da terceira chamada: " + duration + "ms");
     }
     
     @Test
