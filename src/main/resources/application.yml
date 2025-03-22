@@ -1,6 +1,23 @@
+server:
+  port: 8080
+
 spring:
   application:
-    name: rate-limit-app
+    name: ratelimit
+  profiles:
+    active: development
+
+  redis:
+    host: ${REDIS_HOST:redis}
+    port: ${REDIS_PORT:6379}
+    password: ${REDIS_PASSWORD:}
+    database: ${REDIS_DATABASE:0}
+    timeout: 2000
+    lettuce:
+      pool:
+        max-active: 8
+        max-idle: 8
+        min-idle: 0
 
 management:
   endpoints:
@@ -10,18 +27,16 @@ management:
   endpoint:
     health:
       show-details: always
-    metrics:
-      enabled: true
-    prometheus:
-      enabled: true
   metrics:
     export:
       prometheus:
         enabled: true
-    tags:
-      application: ${spring.application.name}
     distribution:
       percentiles-histogram:
-        http.server.requests: true
-      percentiles:
-        http.server.requests: 0.5, 0.75, 0.95, 0.99 
+        "[http.server.requests]": true
+        "[ratelimit.response.time]": true
+
+logging:
+  level:
+    com.example.ratelimit: INFO
+    org.springframework.data.redis: DEBUG 
