@@ -43,6 +43,27 @@ public @interface RateLimit {
      * @return unidade de tempo associada ao rate limit (padrão: {@link TimeUnit#SECONDS}).
      */
     TimeUnit timeUnit() default TimeUnit.SECONDS;
+    
+    /**
+     * Configura um limite adicional (overdraft) que permite ultrapassar temporariamente
+     * o limite definido. Isso é útil para lidar com picos temporários de tráfego.
+     * <p>
+     * Um valor de 0 significa que não há overdraft permitido.
+     * </p>
+     * 
+     * @return número de requisições adicionais permitidas temporariamente (padrão: 0).
+     */
+    int overdraft() default 0;
+    
+    /**
+     * Define se o bucket deve usar refill greedy (recarrega todos os tokens de uma vez)
+     * ou interval (adiciona tokens incrementalmente). O modo greedy é mais adequado
+     * para APIs que precisam lidar com picos de tráfego, enquanto o interval distribui
+     * melhor o tráfego ao longo do tempo.
+     * 
+     * @return true para usar refill greedy, false para usar interval (padrão: true).
+     */
+    boolean greedyRefill() default true;
 
     /**
      * Define a configuração de retry associada ao método anotado.

@@ -16,10 +16,14 @@ public class TestController {
             key = "test",
             limit = 5,
             timeUnit = RateLimit.TimeUnit.MINUTES,
+            overdraft = 2,
+            greedyRefill = true,
             retry = @Retry(
                     maxAttempts = 4,
                     include = {IllegalArgumentException.class},
                     exclude = {IllegalStateException.class},
+                    description = "Retry para o endpoint de teste, com backoff exponencial",
+                    fallbackMethod = "fallback",
                     backoff = @BackoffRetry(
                             delay = 1000,
                             multiplier = 2,
@@ -29,8 +33,18 @@ public class TestController {
     )
     @GetMapping
     public ResponseEntity<String> test() {
-        throw new IllegalArgumentException();
+        throw new IllegalArgumentException("Teste de retry");
 //        return ResponseEntity.ok("Test");
+    }
+
+    @RateLimit(
+            key = "test-normal",
+            limit = 10,
+            timeUnit = RateLimit.TimeUnit.SECONDS
+    )
+    @GetMapping("/normal")
+    public ResponseEntity<String> normalTest() {
+        return ResponseEntity.ok("Test Normal");
     }
 
     public ResponseEntity<String> fallback(Throwable throwable) {

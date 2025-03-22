@@ -11,11 +11,18 @@ import io.github.bucket4j.distributed.ExpirationAfterWriteStrategy;
 import io.github.bucket4j.distributed.proxy.ProxyManager;
 import io.github.bucket4j.distributed.serialization.Mapper;
 import io.github.bucket4j.redis.jedis.Bucket4jJedis;
+import io.micrometer.core.instrument.MeterRegistry;
+import io.micrometer.core.instrument.Tag;
+import io.micrometer.core.instrument.Timer;
 import org.aspectj.lang.ProceedingJoinPoint;
 import org.aspectj.lang.annotation.Around;
 import org.aspectj.lang.annotation.Aspect;
+import org.aspectj.lang.reflect.MethodSignature;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.boot.autoconfigure.condition.ConditionalOnClass;
 import org.springframework.retry.backoff.ExponentialBackOffPolicy;
 import org.springframework.retry.policy.SimpleRetryPolicy;
 import org.springframework.retry.support.RetryTemplate;
@@ -24,36 +31,71 @@ import redis.clients.jedis.JedisPool;
 
 import java.lang.reflect.Method;
 import java.time.Duration;
+import java.util.Arrays;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
-
-import static java.time.Duration.ofSeconds;
+import java.util.function.Supplier;
 
 @Aspect
 @Component
 public class RateLimitAspect {
 
-    private final ProxyManager<String> proxyManager;
     private static final Logger logger = LoggerFactory.getLogger(RateLimitAspect.class);
+    private static final String RATE_LIMITER_PREFIX = "rate_limiter:";
+    
+    private final ProxyManager<String> proxyManager;
+    private final Map<String, Bucket> localBucketCache = new ConcurrentHashMap<>();
+    
+    @Value("${rate-limit.enable-metrics:false}")
+    private boolean enableMetrics;
+    
+    @Value("${rate-limit.cache-expiry-seconds:300}")
+    private long cacheExpirySeconds;
+    
+    @Autowired(required = false)
+    private MeterRegistry meterRegistry;
 
     public RateLimitAspect(JedisPool jedisPool) {
         this.proxyManager = Bucket4jJedis.casBasedBuilder(jedisPool)
-                .expirationAfterWrite(ExpirationAfterWriteStrategy.basedOnTimeForRefillingBucketUpToMax(ofSeconds(10)))
+                .expirationAfterWrite(ExpirationAfterWriteStrategy.basedOnTimeForRefillingBucketUpToMax(Duration.ofSeconds(cacheExpirySeconds)))
                 .keyMapper(Mapper.STRING)
                 .build();
     }
 
     @Around("@annotation(rateLimit)")
     public Object rateLimit(final ProceedingJoinPoint joinPoint, final RateLimit rateLimit) throws Throwable {
-        String key = rateLimit.key();
-        Bucket bucket = resolveBucket(key, rateLimit.limit(), rateLimit.timeUnit());
+        final MethodSignature signature = (MethodSignature) joinPoint.getSignature();
+        final Method method = signature.getMethod();
+        final String methodName = method.getDeclaringClass().getSimpleName() + "." + method.getName();
+        
+        String key = generateKey(rateLimit.key(), methodName);
+        Bucket bucket = resolveBucket(key, rateLimit);
         Retry retry = rateLimit.retry();
 
-        if (retry.maxAttempts() > 1) {
-            return executeWithRetry(joinPoint, retry, bucket, key);
-        } else {
-            return execute(joinPoint, bucket, key);
+        Timer.Sample sample = null;
+        if (enableMetrics && meterRegistry != null) {
+            sample = Timer.start(meterRegistry);
         }
+
+        try {
+            if (retry.maxAttempts() > 1) {
+                return executeWithRetry(joinPoint, retry, bucket, key);
+            } else {
+                return execute(joinPoint, bucket, key);
+            }
+        } finally {
+            if (sample != null) {
+                sample.stop(meterRegistry.timer("rate_limit.execution", 
+                        Arrays.asList(
+                            Tag.of("method", methodName),
+                            Tag.of("key", rateLimit.key())
+                        )));
+            }
+        }
+    }
+
+    private String generateKey(String userKey, String methodName) {
+        return RATE_LIMITER_PREFIX + userKey + ":" + methodName;
     }
 
     private Object execute(final ProceedingJoinPoint joinPoint, final Bucket bucket, final String key) throws Throwable {
@@ -71,6 +113,14 @@ public class RateLimitAspect {
                     logger.warn("[Retry] Retrying after exception: {}, Attempt: {}", ex.getClass().getSimpleName(),
                             context.getRetryCount() + 1);
 
+                    if (enableMetrics && meterRegistry != null) {
+                        meterRegistry.counter("rate_limit.retry.count", 
+                                Arrays.asList(
+                                    Tag.of("key", key),
+                                    Tag.of("exception", ex.getClass().getSimpleName())
+                                )).increment();
+                    }
+
                     throw ex;
                 }
                 throw ex;
@@ -78,9 +128,10 @@ public class RateLimitAspect {
         }, context -> {
             Throwable ex = context.getLastThrowable();
             if (!retry.fallbackMethod().isEmpty()) {
+                logger.info("[Fallback] Max retries reached. Invoking fallback: {}", retry.fallbackMethod());
                 return invokeFallback(joinPoint, retry.fallbackMethod(), ex);
             }
-            throw new RuntimeException(ex);
+            throw new RuntimeException("Rate limit exceeded with retries exhausted", ex);
         });
     }
 
@@ -90,38 +141,86 @@ public class RateLimitAspect {
             final Class<?> targetClass = target.getClass();
 
             final Object[] args = joinPoint.getArgs();
-
             final Object[] extendedArgs = new Object[args.length + 1];
             System.arraycopy(args, 0, extendedArgs, 0, args.length);
             extendedArgs[args.length] = cause;
 
             final Class<?>[] paramTypes = new Class[extendedArgs.length];
             for (int i = 0; i < args.length; i++) {
-                paramTypes[i] = args[i].getClass();
+                paramTypes[i] = args[i] != null ? args[i].getClass() : Object.class;
             }
             paramTypes[args.length] = Throwable.class;
 
-            final Method method = targetClass.getMethod(fallbackMethod, paramTypes);
+            final Method method = findFallbackMethod(targetClass, fallbackMethod, paramTypes);
             logger.info("[Fallback] Invoking fallback method: {}", fallbackMethod);
+            
+            if (enableMetrics && meterRegistry != null) {
+                meterRegistry.counter("rate_limit.fallback.count").increment();
+            }
+            
             return method.invoke(target, extendedArgs);
         } catch (Exception ex) {
             logger.error("[Fallback] Error invoking fallback method: {}", fallbackMethod, ex);
-            throw new RuntimeException(ex);
+            throw new RuntimeException("Error invoking fallback method: " + fallbackMethod, ex);
         }
     }
 
-    private Bucket resolveBucket(final String key, final int limit, final RateLimit.TimeUnit timeUnit) {
-        final long refillIntervalNanos = timeUnit.getTimeInNanos() / limit;
+    private Method findFallbackMethod(Class<?> targetClass, String fallbackMethodName, Class<?>[] paramTypes) throws NoSuchMethodException {
+        try {
+            return targetClass.getMethod(fallbackMethodName, paramTypes);
+        } catch (NoSuchMethodException e) {
+            // Tentar encontrar método com tipos compatíveis
+            for (Method method : targetClass.getMethods()) {
+                if (method.getName().equals(fallbackMethodName) && method.getParameterCount() == paramTypes.length) {
+                    boolean match = true;
+                    Class<?>[] methodParams = method.getParameterTypes();
+                    for (int i = 0; i < methodParams.length; i++) {
+                        if (!methodParams[i].isAssignableFrom(paramTypes[i])) {
+                            match = false;
+                            break;
+                        }
+                    }
+                    if (match) {
+                        return method;
+                    }
+                }
+            }
+            throw new NoSuchMethodException("No compatible fallback method found: " + fallbackMethodName);
+        }
+    }
 
-        final Bandwidth bandwidth = Bandwidth.builder()
-                .capacity(1)
-                .refillIntervally(1, Duration.ofNanos(refillIntervalNanos)) // Configura o intervalo de recarga
+    private Bucket resolveBucket(final String key, final RateLimit rateLimit) {
+        // Tenta obter do cache local primeiro para reduzir overhead de rede
+        return localBucketCache.computeIfAbsent(key, k -> {
+            Supplier<BucketConfiguration> configSupplier = () -> {
+                BucketConfiguration bucketConfig = BucketConfiguration.builder()
+                    .addLimit(createBandwidth(rateLimit))
+                    .build();
+                
+                return bucketConfig;
+            };
+            
+            return proxyManager.getProxy(k, configSupplier);
+        });
+    }
+    
+    private Bandwidth createBandwidth(RateLimit rateLimit) {
+        long nanosInTimeUnit = rateLimit.timeUnit().getTimeInNanos();
+        
+        Bandwidth bandwidth;
+        if (rateLimit.greedyRefill()) {
+            bandwidth = Bandwidth.builder()
+                .capacity(rateLimit.limit() + rateLimit.overdraft())
+                .refillGreedy(rateLimit.limit(), Duration.ofNanos(nanosInTimeUnit))
                 .build();
-
-        final BucketConfiguration configuration = BucketConfiguration.builder()
-                .addLimit(bandwidth)
+        } else {
+            bandwidth = Bandwidth.builder()
+                .capacity(rateLimit.limit() + rateLimit.overdraft())
+                .refillIntervally(rateLimit.limit(), Duration.ofNanos(nanosInTimeUnit))
                 .build();
-        return proxyManager.getProxy(key, () -> configuration);
+        }
+        
+        return bandwidth;
     }
 
     private RetryTemplate createRetryTemplate(final Retry retry) {
@@ -154,12 +253,31 @@ public class RateLimitAspect {
 
     private void consumeToken(final Bucket bucket, final String key) throws InterruptedException {
         ConsumptionProbe probe = bucket.tryConsumeAndReturnRemaining(1);
+        
+        if (enableMetrics && meterRegistry != null) {
+            meterRegistry.gauge("rate_limit.remaining_tokens", 
+                    Arrays.asList(Tag.of("key", key)), 
+                    probe.getRemainingTokens());
+        }
+        
         if (!probe.isConsumed()) {
             long waitForRefillMillis = probe.getNanosToWaitForRefill() / 1_000_000;
             logger.warn("[RateLimit] Key: {}, No tokens available. Acquiring token in approximately {} ms", key, waitForRefillMillis);
 
-            bucket.asBlocking().consume(1);
-            logger.info("[RateLimit] Key: {}, Token acquired after wait", key);
+            try {
+                bucket.asBlocking().consume(1);
+                logger.info("[RateLimit] Key: {}, Token acquired after wait", key);
+                
+                if (enableMetrics && meterRegistry != null) {
+                    meterRegistry.timer("rate_limit.wait_time", 
+                            Arrays.asList(Tag.of("key", key)))
+                            .record(Duration.ofMillis(waitForRefillMillis));
+                }
+            } catch (InterruptedException e) {
+                logger.error("[RateLimit] Thread interrupted while waiting for token", e);
+                Thread.currentThread().interrupt();
+                throw e;
+            }
         }
     }
 

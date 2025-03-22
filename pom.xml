@@ -73,6 +73,13 @@
 			<artifactId>jedis</artifactId>
 			<version>4.2.3</version>
 		</dependency>
+		
+		<!-- Micrometer dependency for metrics -->
+		<dependency>
+			<groupId>io.micrometer</groupId>
+			<artifactId>micrometer-core</artifactId>
+			<version>1.11.5</version>
+		</dependency>
 	</dependencies>
 
 	<build>
